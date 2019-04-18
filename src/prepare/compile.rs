@@ -1012,14 +1012,23 @@ fn compute_drop_keep(
                 start_value_stack_height,
             )));
         }
-        if (actual_value_stack_height as u32 - start_value_stack_height as u32) < keep as u32 {
-            return Err(Error(format!(
-                "Stack underflow detected: asked to keep {:?} values, but there are only {}",
-                keep,
-                actual_value_stack_height as u32 - start_value_stack_height as u32,
-            )));
+
+        match keep {
+            isa::Keep::Single => {
+                if actual_value_stack_height < start_value_stack_height + 1 {
+                    return Err(Error(format!(
+                        "Stack underflow detected: asked to keep {:?} values, but there are only {}",
+                        keep,
+                        actual_value_stack_height as u32 - start_value_stack_height as u32,
+                    )));
+                }
+
+                (actual_value_stack_height - start_value_stack_height - 1) as u32
+            },
+            isa::Keep::None => {
+                (actual_value_stack_height - start_value_stack_height) as u32
+            }
         }
-        (actual_value_stack_height as u32 - start_value_stack_height as u32) - keep as u32
     };
 
     Ok(isa::DropKeep { drop, keep })
