@@ -37,6 +37,13 @@ use {Error, MemoryInstance, Module, RuntimeValue, Signature, TableInstance};
 #[derive(Clone, Debug)]
 pub struct ModuleRef(pub(crate) Rc<ModuleInstance>);
 
+impl ModuleRef {
+    /// Creates a new `ModuleRef` from a `ModuleInstance`.
+    pub fn new(instance: ModuleInstance) -> ModuleRef {
+        ModuleRef(Rc::new(instance))
+    }
+}
+
 impl ::core::ops::Deref for ModuleRef {
     type Target = ModuleInstance;
     fn deref(&self) -> &ModuleInstance {
