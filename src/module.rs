@@ -169,6 +169,31 @@ pub struct ModuleInstance {
     exports: RefCell<BTreeMap<String, ExternVal>>,
 }
 
+impl Clone for ModuleInstance {
+    fn clone(&self) -> Self {
+        let signatures = self.signatures.borrow();
+        let vec = &(*signatures);
+        let signatures = vec
+            .iter()
+            .map(|inner_rc| {
+                    let signature = &**inner_rc;
+                    let signature_clone = signature.clone();
+                    Rc::new(signature_clone)
+			})
+			.collect();
+        let signatures = RefCell::new(signatures);
+
+        ModuleInstance {
+            signatures,
+            tables: self.tables.clone(),
+            funcs: self.funcs.clone(),
+            memories: self.memories.clone(),
+            globals: self.globals.clone(),
+            exports: self.exports.clone(),
+        }
+    }
+}
+
 impl ModuleInstance {
     fn default() -> Self {
         ModuleInstance {
