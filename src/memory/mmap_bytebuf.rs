@@ -49,7 +49,8 @@ impl Mmap {
                 // `MAP_ANON` - mapping is not backed by any file and initial contents are
                 // initialized to zero.
                 // `MAP_PRIVATE` - the mapping is private to this process.
-                libc::MAP_ANON | libc::MAP_PRIVATE,
+                // `MAP_NORESERVE` - do not reserve swap space for this mapping.
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
                 // `fildes` - a file descriptor. Pass -1 as this is required for some platforms
                 // when the `MAP_ANON` is passed.
                 -1,
@@ -120,66 +121,59 @@ impl Drop for Mmap {
 
 pub struct ByteBuf {
     mmap: Option<Mmap>,
+    len: usize,
 }
+
+// NOTE: we either make this an arbitrarily large value and use MAP_NORESERVE
+// (which means we can segfault when writing instead of the allocation
+// failing). or we need to figure out the maximum mem + swap available.
+const MMAP_SIZE: usize = 2 << 40;
 
 impl ByteBuf {
     pub fn new(len: usize) -> Result<Self, &'static str> {
         let mmap = if len == 0 {
             None
         } else {
-            Some(Mmap::new(len)?)
+            Some(Mmap::new(MMAP_SIZE)?)
         };
-        Ok(Self { mmap })
+
+        Ok(Self { mmap, len })
     }
 
     pub fn realloc(&mut self, new_len: usize) -> Result<(), &'static str> {
-        let new_mmap = if new_len == 0 {
-            None
-        } else {
-            if self.len() == 0 {
-                Some(Mmap::new(new_len)?)
-            } else {
-                let mut new_mmap = Mmap::new(new_len)?;
+        if new_len == 0 {
+            self.mmap = None
+        } else if let None = self.mmap {
+            self.mmap = Some(Mmap::new(MMAP_SIZE)?)
+        }
 
-                {
-                    let src = self
-                        .mmap
-                        .as_ref()
-                        .expect(
-                            "self.len() != 0;
-                            self.mmap is created if self.len() != 0;
-                            self.mmap is not `None`;
-                            qed",
-                        )
-                        .as_slice();
-                    let dst = new_mmap.as_slice_mut();
-                    dst[..src.len()].copy_from_slice(src);
-                }
+        self.len = new_len;
 
-                Some(new_mmap)
-            }
-        };
-        self.mmap = new_mmap;
         Ok(())
     }
 
     pub fn len(&self) -> usize {
-        self.mmap.as_ref().map(|m| m.len).unwrap_or(0)
+        self.len
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        self.mmap.as_ref().map(|m| m.as_slice()).unwrap_or(&[])
+        let len = self.len();
+        self.mmap
+            .as_ref()
+            .map(|m| m.as_slice().split_at(len).0)
+            .unwrap_or(&[])
     }
 
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        let len = self.len();
         self.mmap
             .as_mut()
-            .map(|m| m.as_slice_mut())
+            .map(|m| m.as_slice_mut().split_at_mut(len).0)
             .unwrap_or(&mut [])
     }
 
     pub fn erase(&mut self) -> Result<(), &'static str> {
-        let cur_len = match self.mmap {
+        match self.mmap {
             // Nothing to do here...
             None => return Ok(()),
             Some(Mmap { len: cur_len, .. }) => cur_len,
@@ -192,7 +186,7 @@ impl ByteBuf {
         //
         // Otherwise we double the peak memory consumption.
         self.mmap = None;
-        self.mmap = Some(Mmap::new(cur_len)?);
+        self.mmap = Some(Mmap::new(MMAP_SIZE)?);
 
         Ok(())
     }
