@@ -3,8 +3,8 @@ use alloc::prelude::v1::*;
 use alloc::rc::Rc;
 use core::{
     cell::{Cell, RefCell},
-    cmp, fmt,
-    ops::Range,
+    cmp, fmt, slice,
+    ops::{Range, Deref, DerefMut},
     u32,
 };
 use memory_units::{Bytes, Pages, RoundUpTo};
@@ -35,6 +35,22 @@ impl ::core::ops::Deref for MemoryRef {
     }
 }
 
+pub trait Allocator: Deref<Target=[u8]> + DerefMut<Target=[u8]> {
+	fn resize(&mut self, usize, value: u8);
+}
+
+impl Allocator for Vec<u8> {
+	fn resize(&mut self, size: usize, value: u8) {
+		Vec::resize(self, size, value)
+	}
+}
+
+impl Allocator for &'static mut [u8] {
+	fn resize(&mut self, _size: usize, _value: u8) {
+		// no op
+	}
+}
+
 /// Runtime representation of a linear memory (or `memory` for short).
 ///
 /// A memory is a contiguous, mutable array of raw bytes. Wasm code can load and store values
@@ -49,14 +65,16 @@ impl ::core::ops::Deref for MemoryRef {
 ///
 /// [`LINEAR_MEMORY_PAGE_SIZE`]: constant.LINEAR_MEMORY_PAGE_SIZE.html
 pub struct MemoryInstance {
-    /// Memory limits.
-    limits: ResizableLimits,
-    /// Linear memory buffer with lazy allocation.
-    buffer: RefCell<Vec<u8>>,
-    initial: Pages,
-    current_size: Cell<usize>,
-    maximum: Option<Pages>,
-    lowest_used: Cell<u32>,
+	/// Memory limits.
+	limits: ResizableLimits,
+	/// Linear memory buffer with lazy allocation.
+	buffer: RefCell<Box<dyn Allocator>>,
+	initial: Pages,
+	current_size: Cell<usize>,
+	maximum: Option<Pages>,
+	lowest_used: Cell<u32>,
+	buffer_ptr: Cell<*mut u8>,
+	buffer_size: Cell<usize>,
 }
 
 impl fmt::Debug for MemoryInstance {
@@ -126,22 +144,61 @@ impl MemoryInstance {
             validation::validate_memory(initial_u32, maximum_u32).map_err(Error::Memory)?;
         }
 
-        let memory = MemoryInstance::new(initial, maximum);
+		let allocator = Box::new(Vec::with_capacity(4096));
+        let memory = MemoryInstance::new(initial, maximum, allocator);
         Ok(MemoryRef(Rc::new(memory)))
     }
 
+	/// Create a memory instance using specified raw memory. The memory address must
+	/// be aligned to a page size. The size must be a multiple of page size.
+	///
+	/// # Errors
+	///
+	/// Returns `Err` if:
+	///
+	/// - `buffer` is not aligned to page size.
+	/// - `size` is not a multiple of page size.
+	pub fn with_memory(buffer: *mut u8, size: usize) -> Result<MemoryRef, Error> {
+		if (buffer as usize) % LINEAR_MEMORY_PAGE_SIZE.0 != 0 {
+			return Err(Error::Memory(format!(
+				"Buffer address must be aligned to page size",
+			)))
+		}
+
+		if size % LINEAR_MEMORY_PAGE_SIZE.0 != 0 {
+			return Err(Error::Memory(format!(
+				"Size {} must be multiple of page size",
+				size,
+			)))
+		}
+
+		let pages: Pages = Bytes(size).round_up_to();
+		if pages > Pages(validation::LINEAR_MEMORY_MAX_PAGES as usize) {
+			return Err(Error::Memory(format!(
+				"Memory size must be at most {} pages",
+				validation::LINEAR_MEMORY_MAX_PAGES
+			)));
+		}
+		let allocator = unsafe { Box::new(slice::from_raw_parts_mut(buffer, size)) };
+		let memory = MemoryInstance::new(pages, Some(pages), allocator);
+		Ok(MemoryRef(Rc::new(memory)))
+	}
+
     /// Create new linear memory instance.
-    fn new(initial: Pages, maximum: Option<Pages>) -> Self {
+    fn new(initial: Pages, maximum: Option<Pages>, mut allocator: Box<Allocator>) -> Self {
         let limits = ResizableLimits::new(initial.0 as u32, maximum.map(|p| p.0 as u32));
 
         let initial_size: Bytes = initial.into();
+		let ptr = allocator.as_mut_ptr();
         MemoryInstance {
             limits: limits,
-            buffer: RefCell::new(Vec::with_capacity(4096)),
+            buffer: RefCell::new(allocator),
             initial: initial,
             current_size: Cell::new(initial_size.0),
             maximum: maximum,
             lowest_used: Cell::new(u32::max_value()),
+			buffer_ptr: Cell::new(ptr),
+			buffer_size: Cell::new(0),
         }
     }
 
@@ -199,15 +256,15 @@ impl MemoryInstance {
     /// Returns current used memory size in bytes.
     /// This is one more than the highest memory address that had been written to.
     pub fn used_size(&self) -> Bytes {
-        Bytes(self.buffer.borrow().len())
+        Bytes(self.buffer_size.get())
     }
 
     /// Get value from memory at given offset.
     pub fn get_value<T: LittleEndianConvert>(&self, offset: u32) -> Result<T, Error> {
-        let mut buffer = self.buffer.borrow_mut();
         let region =
-            self.checked_region(&mut buffer, offset as usize, ::core::mem::size_of::<T>())?;
-        Ok(T::from_little_endian(&buffer[region.range()]).expect("Slice size is checked"))
+            self.checked_region(offset as usize, ::core::mem::size_of::<T>())?;
+		let mem = unsafe {  slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        Ok(T::from_little_endian(&mem[region.range()]).expect("Slice size is checked"))
     }
 
     /// Copy data from memory at given offset.
@@ -217,10 +274,9 @@ impl MemoryInstance {
     ///
     /// [`get_into`]: #method.get_into
     pub fn get(&self, offset: u32, size: usize) -> Result<Vec<u8>, Error> {
-        let mut buffer = self.buffer.borrow_mut();
-        let region = self.checked_region(&mut buffer, offset as usize, size)?;
-
-        Ok(buffer[region.range()].to_vec())
+        let region = self.checked_region(offset as usize, size)?;
+		let mem = unsafe { slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        Ok(mem[region.range()].to_vec())
     }
 
     /// Copy data from given offset in the memory into `target` slice.
@@ -229,39 +285,37 @@ impl MemoryInstance {
     ///
     /// Returns `Err` if the specified region is out of bounds.
     pub fn get_into(&self, offset: u32, target: &mut [u8]) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
-        let region = self.checked_region(&mut buffer, offset as usize, target.len())?;
-
-        target.copy_from_slice(&buffer[region.range()]);
+        let region = self.checked_region(offset as usize, target.len())?;
+		let mem = unsafe {  slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        target.copy_from_slice(&mem[region.range()]);
 
         Ok(())
     }
 
     /// Copy data in the memory at given offset.
     pub fn set(&self, offset: u32, value: &[u8]) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
         let range = self
-            .checked_region(&mut buffer, offset as usize, value.len())?
+            .checked_region(offset as usize, value.len())?
             .range();
 
         if offset < self.lowest_used.get() {
             self.lowest_used.set(offset);
         }
-        buffer[range].copy_from_slice(value);
-
+		let mem = unsafe { slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        mem[range].copy_from_slice(value);
         Ok(())
     }
 
     /// Copy value in the memory at given offset.
     pub fn set_value<T: LittleEndianConvert>(&self, offset: u32, value: T) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
         let range = self
-            .checked_region(&mut buffer, offset as usize, ::core::mem::size_of::<T>())?
+            .checked_region(offset as usize, ::core::mem::size_of::<T>())?
             .range();
         if offset < self.lowest_used.get() {
             self.lowest_used.set(offset);
         }
-        value.into_little_endian(&mut buffer[range]);
+		let mem = unsafe { slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        value.into_little_endian(&mut mem[range]);
         Ok(())
     }
 
@@ -299,15 +353,11 @@ impl MemoryInstance {
         Ok(size_before_grow)
     }
 
-    fn checked_region<B>(
+    fn checked_region(
         &self,
-        buffer: &mut B,
         offset: usize,
         size: usize,
-    ) -> Result<CheckedRegion, Error>
-    where
-        B: ::core::ops::DerefMut<Target = Vec<u8>>,
-    {
+    ) -> Result<CheckedRegion, Error> {
         let end = offset.checked_add(size).ok_or_else(|| {
             Error::Memory(format!(
                 "trying to access memory block of size {} from offset {}",
@@ -315,16 +365,19 @@ impl MemoryInstance {
             ))
         })?;
 
-        if end <= self.current_size.get() && buffer.len() < end {
-            buffer.resize(end, 0);
+        if end <= self.current_size.get() && self.buffer_size.get() < end {
+			let mut allocator = self.buffer.borrow_mut();
+			allocator.resize(end, 0);
+            self.buffer_ptr.set(allocator.as_mut_ptr());
+            self.buffer_size.set(allocator.len());
         }
 
-        if end > buffer.len() {
+        if end > self.buffer_size.get() {
             return Err(Error::Memory(format!(
                 "trying to access region [{}..{}] in memory [0..{}]",
                 offset,
                 end,
-                buffer.len()
+                self.buffer_size.get(),
             )));
         }
 
@@ -334,17 +387,13 @@ impl MemoryInstance {
         })
     }
 
-    fn checked_region_pair<B>(
+    fn checked_region_pair(
         &self,
-        buffer: &mut B,
         offset1: usize,
         size1: usize,
         offset2: usize,
         size2: usize,
-    ) -> Result<(CheckedRegion, CheckedRegion), Error>
-    where
-        B: ::core::ops::DerefMut<Target = Vec<u8>>,
-    {
+    ) -> Result<(CheckedRegion, CheckedRegion), Error> {
         let end1 = offset1.checked_add(size1).ok_or_else(|| {
             Error::Memory(format!(
                 "trying to access memory block of size {} from offset {}",
@@ -360,25 +409,28 @@ impl MemoryInstance {
         })?;
 
         let max = cmp::max(end1, end2);
-        if max <= self.current_size.get() && buffer.len() < max {
-            buffer.resize(max, 0);
+        if max <= self.current_size.get() && self.buffer_size.get() < max {
+			let mut allocator = self.buffer.borrow_mut();
+			allocator.resize(max, 0);
+			self.buffer_ptr.set(allocator.as_mut_ptr());
+			self.buffer_size.set(allocator.len());
         }
 
-        if end1 > buffer.len() {
+        if end1 > self.buffer_size.get() {
             return Err(Error::Memory(format!(
                 "trying to access region [{}..{}] in memory [0..{}]",
                 offset1,
                 end1,
-                buffer.len()
+                self.buffer_size.get(),
             )));
         }
 
-        if end2 > buffer.len() {
+        if end2 > self.buffer_size.get() {
             return Err(Error::Memory(format!(
                 "trying to access region [{}..{}] in memory [0..{}]",
                 offset2,
                 end2,
-                buffer.len()
+                self.buffer_size.get(),
             )));
         }
 
@@ -402,10 +454,8 @@ impl MemoryInstance {
     ///
     /// Returns `Err` if either of specified regions is out of bounds.
     pub fn copy(&self, src_offset: usize, dst_offset: usize, len: usize) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
-
         let (read_region, write_region) =
-            self.checked_region_pair(&mut buffer, src_offset, len, dst_offset, len)?;
+            self.checked_region_pair(src_offset, len, dst_offset, len)?;
 
         if dst_offset < self.lowest_used.get() as usize {
             self.lowest_used.set(dst_offset as u32);
@@ -413,8 +463,8 @@ impl MemoryInstance {
 
         unsafe {
             ::core::ptr::copy(
-                buffer[read_region.range()].as_ptr(),
-                buffer[write_region.range()].as_mut_ptr(),
+                self.buffer_ptr.get().offset(read_region.offset as isize),
+                self.buffer_ptr.get().offset(write_region.offset as isize),
                 len,
             )
         }
@@ -439,10 +489,9 @@ impl MemoryInstance {
         dst_offset: usize,
         len: usize,
     ) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
 
         let (read_region, write_region) =
-            self.checked_region_pair(&mut buffer, src_offset, len, dst_offset, len)?;
+            self.checked_region_pair(src_offset, len, dst_offset, len)?;
 
         if read_region.intersects(&write_region) {
             return Err(Error::Memory(format!(
@@ -456,8 +505,8 @@ impl MemoryInstance {
 
         unsafe {
             ::core::ptr::copy_nonoverlapping(
-                buffer[read_region.range()].as_ptr(),
-                buffer[write_region.range()].as_mut_ptr(),
+                self.buffer_ptr.get().offset(read_region.offset as isize),
+                self.buffer_ptr.get().offset(write_region.offset as isize),
                 len,
             )
         }
@@ -481,23 +530,24 @@ impl MemoryInstance {
             return src.copy(src_offset, dst_offset, len);
         }
 
-        // Because memory references point to different memory instances, it is safe to `borrow_mut`
-        // both buffers at once (modulo `with_direct_access_mut`).
-        let mut src_buffer = src.buffer.borrow_mut();
-        let mut dst_buffer = dst.buffer.borrow_mut();
-
         let src_range = src
-            .checked_region(&mut src_buffer, src_offset, len)?
+            .checked_region(src_offset, len)?
             .range();
         let dst_range = dst
-            .checked_region(&mut dst_buffer, dst_offset, len)?
+            .checked_region(dst_offset, len)?
             .range();
 
         if dst_offset < dst.lowest_used.get() as usize {
             dst.lowest_used.set(dst_offset as u32);
         }
 
-        dst_buffer[dst_range].copy_from_slice(&src_buffer[src_range]);
+		unsafe {
+			::core::ptr::copy_nonoverlapping(
+				src.buffer_ptr.get().offset(src_range.start as isize),
+				dst.buffer_ptr.get().offset(dst_range.start as isize),
+				len,
+				)
+		}
 
         Ok(())
     }
@@ -510,17 +560,19 @@ impl MemoryInstance {
     ///
     /// Returns `Err` if the specified region is out of bounds.
     pub fn clear(&self, offset: usize, new_val: u8, len: usize) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
-
-        let range = self.checked_region(&mut buffer, offset, len)?.range();
+        let range = self.checked_region(offset, len)?.range();
 
         if offset < self.lowest_used.get() as usize {
             self.lowest_used.set(offset as u32);
         }
 
-        for val in &mut buffer[range] {
-            *val = new_val
-        }
+		unsafe {
+			::core::ptr::write_bytes(
+				self.buffer_ptr.get().offset(range.start as isize),
+				new_val,
+				len,
+			);
+		}
         Ok(())
     }
 
@@ -558,9 +610,9 @@ impl MemoryInstance {
     /// [`get`]: #method.get
     /// [`set`]: #method.set
     /// [`copy`]: #method.copy
-    pub fn with_direct_access_mut<R, F: FnOnce(&mut Vec<u8>) -> R>(&self, f: F) -> R {
+    pub fn with_direct_access_mut<R, F: FnOnce(&mut Allocator) -> R>(&self, f: F) -> R {
         let mut buf = self.buffer.borrow_mut();
-        f(&mut buf)
+        f(&mut **buf)
     }
 }
 
@@ -618,7 +670,7 @@ mod tests {
     }
 
     fn create_memory(initial_content: &[u8]) -> MemoryInstance {
-        let mem = MemoryInstance::new(Pages(1), Some(Pages(1)));
+        let mem = MemoryInstance::new(Pages(1), Some(Pages(1)), Box::new(Vec::new()));
         mem.set(0, initial_content)
             .expect("Successful initialize the memory");
         mem
@@ -731,7 +783,7 @@ mod tests {
 
     #[test]
     fn get_into() {
-        let mem = MemoryInstance::new(Pages(1), None);
+        let mem = MemoryInstance::new(Pages(1), None, Box::new(Vec::new()));
         mem.set(6, &[13, 17, 129])
             .expect("memory set should not fail");
 
