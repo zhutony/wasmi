@@ -36,19 +36,19 @@ impl ::core::ops::Deref for MemoryRef {
 }
 
 pub trait Allocator: Deref<Target=[u8]> + DerefMut<Target=[u8]> {
-	fn resize(&mut self, usize, value: u8);
+    fn resize(&mut self, usize, value: u8);
 }
 
 impl Allocator for Vec<u8> {
-	fn resize(&mut self, size: usize, value: u8) {
-		Vec::resize(self, size, value)
-	}
+    fn resize(&mut self, size: usize, value: u8) {
+        Vec::resize(self, size, value)
+    }
 }
 
 impl Allocator for &'static mut [u8] {
-	fn resize(&mut self, _size: usize, _value: u8) {
-		// no op
-	}
+    fn resize(&mut self, _size: usize, _value: u8) {
+        // no op
+    }
 }
 
 /// Runtime representation of a linear memory (or `memory` for short).
@@ -65,16 +65,16 @@ impl Allocator for &'static mut [u8] {
 ///
 /// [`LINEAR_MEMORY_PAGE_SIZE`]: constant.LINEAR_MEMORY_PAGE_SIZE.html
 pub struct MemoryInstance {
-	/// Memory limits.
-	limits: ResizableLimits,
-	/// Linear memory buffer with lazy allocation.
-	buffer: RefCell<Box<dyn Allocator>>,
-	initial: Pages,
-	current_size: Cell<usize>,
-	maximum: Option<Pages>,
-	lowest_used: Cell<u32>,
-	buffer_ptr: Cell<*mut u8>,
-	buffer_size: Cell<usize>,
+    /// Memory limits.
+    limits: ResizableLimits,
+    /// Linear memory buffer with lazy allocation.
+    buffer: RefCell<Box<dyn Allocator>>,
+    initial: Pages,
+    current_size: Cell<usize>,
+    maximum: Option<Pages>,
+    lowest_used: Cell<u32>,
+    buffer_ptr: Cell<*mut u8>,
+    buffer_size: Cell<usize>,
 }
 
 impl fmt::Debug for MemoryInstance {
@@ -144,52 +144,52 @@ impl MemoryInstance {
             validation::validate_memory(initial_u32, maximum_u32).map_err(Error::Memory)?;
         }
 
-		let allocator = Box::new(Vec::with_capacity(4096));
+        let allocator = Box::new(Vec::with_capacity(4096));
         let memory = MemoryInstance::new(initial, maximum, allocator);
         Ok(MemoryRef(Rc::new(memory)))
     }
 
-	/// Create a memory instance using specified raw memory. The memory address must
-	/// be aligned to a page size. The size must be a multiple of page size.
-	///
-	/// # Errors
-	///
-	/// Returns `Err` if:
-	///
-	/// - `buffer` is not aligned to page size.
-	/// - `size` is not a multiple of page size.
-	pub fn with_memory(buffer: *mut u8, size: usize) -> Result<MemoryRef, Error> {
-		if (buffer as usize) % LINEAR_MEMORY_PAGE_SIZE.0 != 0 {
-			return Err(Error::Memory(format!(
-				"Buffer address must be aligned to page size",
-			)))
-		}
+    /// Create a memory instance using specified raw memory. The memory address must
+    /// be aligned to a page size. The size must be a multiple of page size.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if:
+    ///
+    /// - `buffer` is not aligned to page size.
+    /// - `size` is not a multiple of page size.
+    pub fn with_memory(buffer: *mut u8, size: usize) -> Result<MemoryRef, Error> {
+        if (buffer as usize) % LINEAR_MEMORY_PAGE_SIZE.0 != 0 {
+            return Err(Error::Memory(format!(
+                "Buffer address must be aligned to page size",
+            )))
+        }
 
-		if size % LINEAR_MEMORY_PAGE_SIZE.0 != 0 {
-			return Err(Error::Memory(format!(
-				"Size {} must be multiple of page size",
-				size,
-			)))
-		}
+        if size % LINEAR_MEMORY_PAGE_SIZE.0 != 0 {
+            return Err(Error::Memory(format!(
+                "Size {} must be multiple of page size",
+                size,
+            )))
+        }
 
-		let pages: Pages = Bytes(size).round_up_to();
-		if pages > Pages(validation::LINEAR_MEMORY_MAX_PAGES as usize) {
-			return Err(Error::Memory(format!(
-				"Memory size must be at most {} pages",
-				validation::LINEAR_MEMORY_MAX_PAGES
-			)));
-		}
-		let allocator = unsafe { Box::new(slice::from_raw_parts_mut(buffer, size)) };
-		let memory = MemoryInstance::new(pages, Some(pages), allocator);
-		Ok(MemoryRef(Rc::new(memory)))
-	}
+        let pages: Pages = Bytes(size).round_up_to();
+        if pages > Pages(validation::LINEAR_MEMORY_MAX_PAGES as usize) {
+            return Err(Error::Memory(format!(
+                "Memory size must be at most {} pages",
+                validation::LINEAR_MEMORY_MAX_PAGES
+            )));
+        }
+        let allocator = unsafe { Box::new(slice::from_raw_parts_mut(buffer, size)) };
+        let memory = MemoryInstance::new(pages, Some(pages), allocator);
+        Ok(MemoryRef(Rc::new(memory)))
+    }
 
     /// Create new linear memory instance.
     fn new(initial: Pages, maximum: Option<Pages>, mut allocator: Box<Allocator>) -> Self {
         let limits = ResizableLimits::new(initial.0 as u32, maximum.map(|p| p.0 as u32));
 
         let initial_size: Bytes = initial.into();
-		let ptr = allocator.as_mut_ptr();
+        let ptr = allocator.as_mut_ptr();
         MemoryInstance {
             limits: limits,
             buffer: RefCell::new(allocator),
@@ -197,8 +197,8 @@ impl MemoryInstance {
             current_size: Cell::new(initial_size.0),
             maximum: maximum,
             lowest_used: Cell::new(u32::max_value()),
-			buffer_ptr: Cell::new(ptr),
-			buffer_size: Cell::new(0),
+            buffer_ptr: Cell::new(ptr),
+            buffer_size: Cell::new(0),
         }
     }
 
@@ -263,7 +263,7 @@ impl MemoryInstance {
     pub fn get_value<T: LittleEndianConvert>(&self, offset: u32) -> Result<T, Error> {
         let region =
             self.checked_region(offset as usize, ::core::mem::size_of::<T>())?;
-		let mem = unsafe {  slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        let mem = unsafe {  slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
         Ok(T::from_little_endian(&mem[region.range()]).expect("Slice size is checked"))
     }
 
@@ -275,7 +275,7 @@ impl MemoryInstance {
     /// [`get_into`]: #method.get_into
     pub fn get(&self, offset: u32, size: usize) -> Result<Vec<u8>, Error> {
         let region = self.checked_region(offset as usize, size)?;
-		let mem = unsafe { slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        let mem = unsafe { slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
         Ok(mem[region.range()].to_vec())
     }
 
@@ -286,7 +286,7 @@ impl MemoryInstance {
     /// Returns `Err` if the specified region is out of bounds.
     pub fn get_into(&self, offset: u32, target: &mut [u8]) -> Result<(), Error> {
         let region = self.checked_region(offset as usize, target.len())?;
-		let mem = unsafe {  slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        let mem = unsafe {  slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
         target.copy_from_slice(&mem[region.range()]);
 
         Ok(())
@@ -301,7 +301,7 @@ impl MemoryInstance {
         if offset < self.lowest_used.get() {
             self.lowest_used.set(offset);
         }
-		let mem = unsafe { slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        let mem = unsafe { slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
         mem[range].copy_from_slice(value);
         Ok(())
     }
@@ -314,7 +314,7 @@ impl MemoryInstance {
         if offset < self.lowest_used.get() {
             self.lowest_used.set(offset);
         }
-		let mem = unsafe { slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
+        let mem = unsafe { slice::from_raw_parts_mut(self.buffer_ptr.get(), self.buffer_size.get()) };
         value.into_little_endian(&mut mem[range]);
         Ok(())
     }
@@ -366,8 +366,8 @@ impl MemoryInstance {
         })?;
 
         if end <= self.current_size.get() && self.buffer_size.get() < end {
-			let mut allocator = self.buffer.borrow_mut();
-			allocator.resize(end, 0);
+            let mut allocator = self.buffer.borrow_mut();
+            allocator.resize(end, 0);
             self.buffer_ptr.set(allocator.as_mut_ptr());
             self.buffer_size.set(allocator.len());
         }
@@ -410,10 +410,10 @@ impl MemoryInstance {
 
         let max = cmp::max(end1, end2);
         if max <= self.current_size.get() && self.buffer_size.get() < max {
-			let mut allocator = self.buffer.borrow_mut();
-			allocator.resize(max, 0);
-			self.buffer_ptr.set(allocator.as_mut_ptr());
-			self.buffer_size.set(allocator.len());
+            let mut allocator = self.buffer.borrow_mut();
+            allocator.resize(max, 0);
+            self.buffer_ptr.set(allocator.as_mut_ptr());
+            self.buffer_size.set(allocator.len());
         }
 
         if end1 > self.buffer_size.get() {
@@ -541,13 +541,13 @@ impl MemoryInstance {
             dst.lowest_used.set(dst_offset as u32);
         }
 
-		unsafe {
-			::core::ptr::copy_nonoverlapping(
-				src.buffer_ptr.get().offset(src_range.start as isize),
-				dst.buffer_ptr.get().offset(dst_range.start as isize),
-				len,
-				)
-		}
+        unsafe {
+            ::core::ptr::copy_nonoverlapping(
+                src.buffer_ptr.get().offset(src_range.start as isize),
+                dst.buffer_ptr.get().offset(dst_range.start as isize),
+                len,
+                )
+        }
 
         Ok(())
     }
@@ -566,13 +566,13 @@ impl MemoryInstance {
             self.lowest_used.set(offset as u32);
         }
 
-		unsafe {
-			::core::ptr::write_bytes(
-				self.buffer_ptr.get().offset(range.start as isize),
-				new_val,
-				len,
-			);
-		}
+        unsafe {
+            ::core::ptr::write_bytes(
+                self.buffer_ptr.get().offset(range.start as isize),
+                new_val,
+                len,
+            );
+        }
         Ok(())
     }
 
