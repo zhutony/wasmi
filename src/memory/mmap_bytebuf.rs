@@ -7,7 +7,7 @@
 
 use std::ptr::{self, NonNull};
 use std::slice;
-use super::MemoryBackend;
+use super::{MemoryBackend, ByteBuf};
 
 struct Mmap {
     /// The pointer that points to the start of the mapping.
@@ -132,11 +132,11 @@ impl MmapByteBuf {
 }
 
 impl MemoryBackend for MmapByteBuf {
-    fn alloc(&mut self, initial: usize, _maximum: usize) -> Result<(), &'static str> {
+    fn alloc(&mut self, initial: usize, _maximum: Option<usize>) -> Result<ByteBuf, &'static str> {
         self.realloc(initial)
     }
 
-    fn realloc(&mut self, new_len: usize) -> Result<(), &'static str> {
+    fn realloc(&mut self, new_len: usize) -> Result<ByteBuf, &'static str> {
         let new_mmap = if new_len == 0 {
             None
         } else {
@@ -150,27 +150,16 @@ impl MemoryBackend for MmapByteBuf {
             Some(new_mmap)
         };
 
+        let bytebuf = ByteBuf {
+            ptr: new_mmap.as_ref().map(|m| m.ptr.as_ptr()).unwrap_or(NonNull::dangling().as_ptr()),
+            len: new_mmap.as_ref().map(|m| m.len).unwrap_or(0),
+        };
         self.mmap = new_mmap;
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.mmap.as_ref().map(|m| m.len).unwrap_or(0)
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        self.mmap.as_ref().map(|m| m.as_slice()).unwrap_or(&[])
-    }
-
-    fn as_slice_mut(&mut self) -> &mut [u8] {
-        self.mmap
-            .as_mut()
-            .map(|m| m.as_slice_mut())
-            .unwrap_or(&mut [])
+        Ok(bytebuf)
     }
 
     fn erase(&mut self) -> Result<(), &'static str> {
-        let len = self.len();
+        let len = self.mmap.as_ref().map(|m| m.len).unwrap_or(0);
         if len > 0 {
             // The order is important.
             //

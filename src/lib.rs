@@ -404,7 +404,7 @@ pub use self::func::{FuncInstance, FuncInvocation, FuncRef, ResumableError};
 pub use self::global::{GlobalInstance, GlobalRef};
 pub use self::host::{Externals, HostError, NopExternals, RuntimeArgs};
 pub use self::imports::{ImportResolver, ImportsBuilder, ModuleImportResolver};
-pub use self::memory::{MemoryBackend, MemoryInstance, MemoryRef, LINEAR_MEMORY_PAGE_SIZE};
+pub use self::memory::{MemoryBackend, ByteBuf, MemoryInstance, MemoryRef, LINEAR_MEMORY_PAGE_SIZE};
 pub use self::module::{ExternVal, ModuleInstance, ModuleRef, NotStartedModuleRef};
 pub use self::runner::{StackRecycler, DEFAULT_CALL_STACK_LIMIT, DEFAULT_VALUE_STACK_LIMIT};
 pub use self::table::{TableInstance, TableRef};

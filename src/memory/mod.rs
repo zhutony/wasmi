@@ -3,6 +3,7 @@ use core::{
     cell::{Cell, RefCell},
     cmp, fmt,
     ops::Range,
+    slice,
     u32,
 };
 use memory_units::{Bytes, Pages, RoundUpTo};
@@ -43,12 +44,32 @@ impl ::core::ops::Deref for MemoryRef {
     }
 }
 
+pub struct ByteBuf {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+impl ByteBuf {
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe {
+            slice::from_raw_parts(self.ptr, self.len)
+        }
+    }
+
+    pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            slice::from_raw_parts_mut(self.ptr, self.len)
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
 pub trait MemoryBackend {
-    fn alloc(&mut self, initial: usize, maximum: usize) -> Result<(), &'static str>;
-    fn realloc(&mut self, new_len: usize) -> Result<(), &'static str>;
-    fn len(&self) -> usize;
-    fn as_slice(&self) -> &[u8];
-    fn as_slice_mut(&mut self) -> &mut [u8];
+    fn alloc(&mut self, initial: usize, maximum: Option<usize>) -> Result<ByteBuf, &'static str>;
+    fn realloc(&mut self, new_len: usize) -> Result<ByteBuf, &'static str>;
     fn erase(&mut self) -> Result<(), &'static str>;
 }
 
@@ -69,7 +90,8 @@ pub struct MemoryInstance {
     /// Memory limits.
     limits: ResizableLimits,
     /// Linear memory buffer with lazy allocation.
-    buffer: RefCell<Box<dyn MemoryBackend>>,
+    backend: RefCell<Box<dyn MemoryBackend>>,
+    bytebuf: RefCell<ByteBuf>,
     initial: Pages,
     current_size: Cell<usize>,
     maximum: Option<Pages>,
@@ -79,7 +101,7 @@ impl fmt::Debug for MemoryInstance {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("MemoryInstance")
             .field("limits", &self.limits)
-            .field("buffer.len", &self.buffer.borrow().len())
+            .field("buffer.len", &self.bytebuf.borrow().len())
             .field("maximum", &self.maximum)
             .field("initial", &self.initial)
             .finish()
@@ -151,19 +173,33 @@ impl MemoryInstance {
         let limits = ResizableLimits::new(initial.0 as u32, maximum.map(|p| p.0 as u32));
 
         let initial_size: Bytes = initial.into();
-        let bytebuf = MmapByteBuf::new(initial_size.0).map_err(|err| Error::Memory(err.to_string()))?;
+        let maximum_size: Option<Bytes> = maximum.map(|m| m.into());
+        let mut backend = MmapByteBuf::new(initial_size.0).map_err(|err| Error::Memory(err.to_string()))?;
+        let bytebuf = backend.alloc(
+            initial_size.0,
+            maximum_size.map(|m| m.0),
+        ).map_err(|err| Error::Memory(err.to_string()))?;
 
         Ok(MemoryInstance {
             limits: limits,
-            buffer: RefCell::new(Box::new(bytebuf)),
+            backend: RefCell::new(Box::new(backend)),
+            bytebuf: RefCell::new(bytebuf),
             initial: initial,
             current_size: Cell::new(initial_size.0),
             maximum: maximum,
         })
     }
 
-    pub fn set_backend(&self, backend: Box<dyn MemoryBackend>) {
-        *self.buffer.borrow_mut() = backend;
+    pub fn set_backend(&self, mut backend: Box<dyn MemoryBackend>) {
+        let initial_size: Bytes = self.initial.into();
+        let maximum_size: Option<Bytes> = self.maximum.map(|m| m.into());
+
+        let bytebuf = backend.alloc(
+            initial_size.0,
+            maximum_size.map(|m| m.0),
+        ).unwrap();
+        *self.backend.borrow_mut() = backend;
+        *self.bytebuf.borrow_mut() = bytebuf;
     }
 
     /// Return linear memory limits.
@@ -204,12 +240,12 @@ impl MemoryInstance {
     /// );
     /// ```
     pub fn current_size(&self) -> Pages {
-        Bytes(self.buffer.borrow().len()).round_up_to()
+        Bytes(self.bytebuf.borrow().len()).round_up_to()
     }
 
     /// Get value from memory at given offset.
     pub fn get_value<T: LittleEndianConvert>(&self, offset: u32) -> Result<T, Error> {
-        let mut buffer = self.buffer.borrow_mut();
+        let mut buffer = self.bytebuf.borrow_mut();
         let region =
             self.checked_region(&mut buffer, offset as usize, ::core::mem::size_of::<T>())?;
         Ok(
@@ -225,7 +261,7 @@ impl MemoryInstance {
     ///
     /// [`get_into`]: #method.get_into
     pub fn get(&self, offset: u32, size: usize) -> Result<Vec<u8>, Error> {
-        let mut buffer = self.buffer.borrow_mut();
+        let mut buffer = self.bytebuf.borrow_mut();
         let region = self.checked_region(&mut buffer, offset as usize, size)?;
 
         Ok(buffer.as_slice_mut()[region.range()].to_vec())
@@ -237,7 +273,7 @@ impl MemoryInstance {
     ///
     /// Returns `Err` if the specified region is out of bounds.
     pub fn get_into(&self, offset: u32, target: &mut [u8]) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
+        let mut buffer = self.bytebuf.borrow_mut();
         let region = self.checked_region(&mut buffer, offset as usize, target.len())?;
 
         target.copy_from_slice(&buffer.as_slice_mut()[region.range()]);
@@ -247,7 +283,7 @@ impl MemoryInstance {
 
     /// Copy data in the memory at given offset.
     pub fn set(&self, offset: u32, value: &[u8]) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
+        let mut buffer = self.bytebuf.borrow_mut();
         let range = self
             .checked_region(&mut buffer, offset as usize, value.len())?
             .range();
@@ -259,7 +295,7 @@ impl MemoryInstance {
 
     /// Copy value in the memory at given offset.
     pub fn set_value<T: LittleEndianConvert>(&self, offset: u32, value: T) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
+        let mut buffer = self.bytebuf.borrow_mut();
         let range = self
             .checked_region(&mut buffer, offset as usize, ::core::mem::size_of::<T>())?
             .range();
@@ -297,10 +333,11 @@ impl MemoryInstance {
         }
 
         let new_buffer_length: Bytes = new_size.into();
-        self.buffer
+        let bytebuf = self.backend
             .borrow_mut()
             .realloc(new_buffer_length.0)
             .map_err(|err| Error::Memory(err.to_string()))?;
+        *self.bytebuf.borrow_mut() = bytebuf;
 
         self.current_size.set(new_buffer_length.0);
 
@@ -309,7 +346,7 @@ impl MemoryInstance {
 
     fn checked_region(
         &self,
-        buffer: &mut Box<dyn MemoryBackend>,
+        buffer: &mut ByteBuf,
         offset: usize,
         size: usize,
     ) -> Result<CheckedRegion, Error> {
@@ -337,7 +374,7 @@ impl MemoryInstance {
 
     fn checked_region_pair(
         &self,
-        buffer: &mut Box<dyn MemoryBackend>,
+        buffer: &mut ByteBuf,
         offset1: usize,
         size1: usize,
         offset2: usize,
@@ -395,7 +432,7 @@ impl MemoryInstance {
     ///
     /// Returns `Err` if either of specified regions is out of bounds.
     pub fn copy(&self, src_offset: usize, dst_offset: usize, len: usize) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
+        let mut buffer = self.bytebuf.borrow_mut();
 
         let (read_region, write_region) =
             self.checked_region_pair(&mut buffer, src_offset, len, dst_offset, len)?;
@@ -428,7 +465,7 @@ impl MemoryInstance {
         dst_offset: usize,
         len: usize,
     ) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
+        let mut buffer = self.bytebuf.borrow_mut();
 
         let (read_region, write_region) =
             self.checked_region_pair(&mut buffer, src_offset, len, dst_offset, len)?;
@@ -468,8 +505,8 @@ impl MemoryInstance {
 
         // Because memory references point to different memory instances, it is safe to `borrow_mut`
         // both buffers at once (modulo `with_direct_access_mut`).
-        let mut src_buffer = src.buffer.borrow_mut();
-        let mut dst_buffer = dst.buffer.borrow_mut();
+        let mut src_buffer = src.bytebuf.borrow_mut();
+        let mut dst_buffer = dst.bytebuf.borrow_mut();
 
         let src_range = src
             .checked_region(&mut src_buffer, src_offset, len)?
@@ -491,7 +528,7 @@ impl MemoryInstance {
     ///
     /// Returns `Err` if the specified region is out of bounds.
     pub fn clear(&self, offset: usize, new_val: u8, len: usize) -> Result<(), Error> {
-        let mut buffer = self.buffer.borrow_mut();
+        let mut buffer = self.bytebuf.borrow_mut();
 
         let range = self.checked_region(&mut buffer, offset, len)?.range();
 
@@ -514,7 +551,7 @@ impl MemoryInstance {
     ///
     /// Might be useful for some optimization shenanigans.
     pub fn erase(&self) -> Result<(), Error> {
-        self.buffer
+        self.backend
             .borrow_mut()
             .erase()
             .map_err(|err| Error::Memory(err.to_string()))
@@ -530,7 +567,7 @@ impl MemoryInstance {
     /// [`set`]: #method.get
     /// [`clear`]: #method.set
     pub fn with_direct_access<R, F: FnOnce(&[u8]) -> R>(&self, f: F) -> R {
-        let buf = self.buffer.borrow();
+        let buf = self.bytebuf.borrow();
         f(buf.as_slice())
     }
 
@@ -544,7 +581,7 @@ impl MemoryInstance {
     /// [`get`]: #method.get
     /// [`set`]: #method.set
     pub fn with_direct_access_mut<R, F: FnOnce(&mut [u8]) -> R>(&self, f: F) -> R {
-        let mut buf = self.buffer.borrow_mut();
+        let mut buf = self.bytebuf.borrow_mut();
         f(buf.as_slice_mut())
     }
 }
