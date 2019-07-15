@@ -7,6 +7,7 @@
 
 use std::ptr::{self, NonNull};
 use std::slice;
+use super::MemoryBackend;
 
 struct Mmap {
     /// The pointer that points to the start of the mapping.
@@ -111,11 +112,15 @@ impl Drop for Mmap {
     }
 }
 
-pub struct ByteBuf {
+pub struct MmapByteBuf {
     mmap: Option<Mmap>,
 }
 
-impl ByteBuf {
+impl MmapByteBuf {
+    pub fn empty() -> Self {
+        MmapByteBuf { mmap: None }
+    }
+
     pub fn new(len: usize) -> Result<Self, &'static str> {
         let mmap = if len == 0 {
             None
@@ -124,8 +129,14 @@ impl ByteBuf {
         };
         Ok(Self { mmap })
     }
+}
 
-    pub fn realloc(&mut self, new_len: usize) -> Result<(), &'static str> {
+impl MemoryBackend for MmapByteBuf {
+    fn alloc(&mut self, initial: usize, _maximum: usize) -> Result<(), &'static str> {
+        self.realloc(initial)
+    }
+
+    fn realloc(&mut self, new_len: usize) -> Result<(), &'static str> {
         let new_mmap = if new_len == 0 {
             None
         } else {
@@ -143,22 +154,22 @@ impl ByteBuf {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.mmap.as_ref().map(|m| m.len).unwrap_or(0)
     }
 
-    pub fn as_slice(&self) -> &[u8] {
+    fn as_slice(&self) -> &[u8] {
         self.mmap.as_ref().map(|m| m.as_slice()).unwrap_or(&[])
     }
 
-    pub fn as_slice_mut(&mut self) -> &mut [u8] {
+    fn as_slice_mut(&mut self) -> &mut [u8] {
         self.mmap
             .as_mut()
             .map(|m| m.as_slice_mut())
             .unwrap_or(&mut [])
     }
 
-    pub fn erase(&mut self) -> Result<(), &'static str> {
+    fn erase(&mut self) -> Result<(), &'static str> {
         let len = self.len();
         if len > 0 {
             // The order is important.
@@ -176,14 +187,14 @@ impl ByteBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::ByteBuf;
+    use super::{MmapByteBuf, MemoryBackend};
 
     const PAGE_SIZE: usize = 4096;
 
     // This is not required since wasm memories can only grow but nice to have.
     #[test]
     fn byte_buf_shrink() {
-        let mut byte_buf = ByteBuf::new(PAGE_SIZE * 3).unwrap();
+        let mut byte_buf = MmapByteBuf::new(PAGE_SIZE * 3).unwrap();
         byte_buf.realloc(PAGE_SIZE * 2).unwrap();
     }
 }

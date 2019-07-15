@@ -11,14 +11,14 @@ use value::LittleEndianConvert;
 use Error;
 
 #[cfg(all(unix, not(feature = "vec_memory")))]
-#[path = "mmap_bytebuf.rs"]
-mod bytebuf;
+#[path="mmap_bytebuf.rs"]
+mod mmap_bytebuf;
 
-#[cfg(any(not(unix), feature = "vec_memory"))]
-#[path = "vec_bytebuf.rs"]
-mod bytebuf;
+#[cfg(all(unix, not(feature = "vec_memory")))]
+use self::mmap_bytebuf::MmapByteBuf;
 
-use self::bytebuf::ByteBuf;
+// #[cfg(any(not(unix), feature = "vec_memory"))]
+// mod bytebuf;
 
 /// Size of a page of [linear memory][`MemoryInstance`] - 64KiB.
 ///
@@ -43,6 +43,15 @@ impl ::core::ops::Deref for MemoryRef {
     }
 }
 
+pub trait MemoryBackend {
+    fn alloc(&mut self, initial: usize, maximum: usize) -> Result<(), &'static str>;
+    fn realloc(&mut self, new_len: usize) -> Result<(), &'static str>;
+    fn len(&self) -> usize;
+    fn as_slice(&self) -> &[u8];
+    fn as_slice_mut(&mut self) -> &mut [u8];
+    fn erase(&mut self) -> Result<(), &'static str>;
+}
+
 /// Runtime representation of a linear memory (or `memory` for short).
 ///
 /// A memory is a contiguous, mutable array of raw bytes. Wasm code can load and store values
@@ -60,7 +69,7 @@ pub struct MemoryInstance {
     /// Memory limits.
     limits: ResizableLimits,
     /// Linear memory buffer with lazy allocation.
-    buffer: RefCell<ByteBuf>,
+    buffer: RefCell<Box<dyn MemoryBackend>>,
     initial: Pages,
     current_size: Cell<usize>,
     maximum: Option<Pages>,
@@ -142,15 +151,19 @@ impl MemoryInstance {
         let limits = ResizableLimits::new(initial.0 as u32, maximum.map(|p| p.0 as u32));
 
         let initial_size: Bytes = initial.into();
+        let bytebuf = MmapByteBuf::new(initial_size.0).map_err(|err| Error::Memory(err.to_string()))?;
+
         Ok(MemoryInstance {
             limits: limits,
-            buffer: RefCell::new(
-                ByteBuf::new(initial_size.0).map_err(|err| Error::Memory(err.to_string()))?,
-            ),
+            buffer: RefCell::new(Box::new(bytebuf)),
             initial: initial,
             current_size: Cell::new(initial_size.0),
             maximum: maximum,
         })
+    }
+
+    pub fn set_backend(&self, backend: Box<dyn MemoryBackend>) {
+        *self.buffer.borrow_mut() = backend;
     }
 
     /// Return linear memory limits.
@@ -296,7 +309,7 @@ impl MemoryInstance {
 
     fn checked_region(
         &self,
-        buffer: &mut ByteBuf,
+        buffer: &mut Box<dyn MemoryBackend>,
         offset: usize,
         size: usize,
     ) -> Result<CheckedRegion, Error> {
@@ -324,7 +337,7 @@ impl MemoryInstance {
 
     fn checked_region_pair(
         &self,
-        buffer: &mut ByteBuf,
+        buffer: &mut Box<dyn MemoryBackend>,
         offset1: usize,
         size1: usize,
         offset2: usize,
