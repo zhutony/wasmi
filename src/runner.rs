@@ -1289,12 +1289,9 @@ impl FunctionContext {
         debug_assert!(!self.is_initialized);
 
         let num_locals = locals.iter().map(|l| l.count() as usize).sum();
-        let locals = vec![Default::default(); num_locals];
-
-        // TODO: Replace with extend.
-        for local in locals {
+        for _ in 0..num_locals {
             value_stack
-                .push(local)
+                .push(Default::default())
                 .map_err(|_| TrapKind::StackOverflow)?;
         }
 
